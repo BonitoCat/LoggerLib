@@ -46,7 +46,12 @@ public static class Logger
         AppDomain.CurrentDomain.ProcessExit += OnExit;
         AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
         {
-            LogE($"Unhandled exception: {e.ExceptionObject}").GetAwaiter().GetResult();
+            try
+            {
+                LogE($"Unhandled exception: {e.ExceptionObject}").GetAwaiter().GetResult();
+            }
+            catch (InvalidOperationException) { }
+            
             if (e.IsTerminating)
             {
                 OnExit(sender, EventArgs.Empty);
@@ -57,13 +62,22 @@ public static class Logger
         {
             if (LogFirstChance)
             {
-                LogE($"First chance: {e.Exception}");
+                try
+                {
+                    LogE($"First chance: {e.Exception}");
+                }
+                catch (InvalidOperationException) { }
             }
         };
 
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
-            LogE($"Unobserved task exception: {e.Exception}");
+            try
+            {
+                LogE($"Unobserved task exception: {e.Exception}");
+            }
+            catch (InvalidOperationException) { }
+            
             e.SetObserved();
         };
     }
@@ -77,7 +91,7 @@ public static class Logger
         
         if (LogDir == null)
         {
-            return;
+            throw new NullReferenceException("LogDir has not been set");
         }
 
         if (_stream != null)
@@ -211,6 +225,10 @@ public static class Logger
 
     private static void OnExit(object? sender, EventArgs e)
     {
-        LogI("Process exiting...").GetAwaiter().GetResult();;
+        try
+        {
+            LogI("Process exiting...").GetAwaiter().GetResult();
+        }
+        catch (InvalidOperationException) { }
     }
 }
