@@ -1,11 +1,17 @@
-﻿using System.Diagnostics;
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Text;
+using FileLib;
 
 namespace LoggerLib;
 
 public static class Logger
 {
+    [DllImport("libc", SetLastError = true)]
+    private static extern int chmod(string pathname, uint mode);
+        
+    [DllImport("libc", SetLastError = true)]
+    private static extern int chown(string path, uint owner, uint group);
+    
     /// <summary>
     /// If false, the logger will not be logging any information.
     /// Log files will also not be created while this is false.
@@ -29,11 +35,23 @@ public static class Logger
     public static bool LogDebug { get; set; } = true;
     
     /// <summary>
+    /// The logger will only log calls higher or equal to the set value. This excludes debug, see <see cref="LogDebug"/>.
+    /// </summary>
+    public static LogLevel LogLevel { get; set; } = LogLevel.Info;
+    
+    /// <summary>
     /// If false, first chance exceptions will not be logged. Set this if the logger is flooded with exceptions.
     /// </summary>
     public static bool LogFirstChance { get; set; } = true;
 
-    private static readonly SemaphoreSlim _semaphore = new(1, 1);
+    /// <summary>
+    /// If true, opens a terminal and prints all the logs live into it.
+    /// </summary>
+    public static bool LogToTerminal { get; set; }
+
+    public static bool HasFileBeenCreated { get; private set; }
+    
+    private static readonly SemaphoreSlim Semaphore = new(1, 1);
     private static FileStream? _stream;
 
     static Logger()
@@ -41,39 +59,61 @@ public static class Logger
         Initialize();
     }
     
-    public static void Initialize()
+    private static void Initialize()
     {
         AppDomain.CurrentDomain.ProcessExit += OnExit;
         AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
         {
             try
             {
+                if (!HasFileBeenCreated)
+                {
+                    return;
+                }
+                
                 LogE($"Unhandled exception: {e.ExceptionObject}").GetAwaiter().GetResult();
             }
             catch (InvalidOperationException) { }
             
             if (e.IsTerminating)
             {
+                if (!HasFileBeenCreated)
+                {
+                    return;
+                }
+
                 OnExit(sender, EventArgs.Empty);
             }
         };
 
         AppDomain.CurrentDomain.FirstChanceException += (_, e) =>
         {
-            if (LogFirstChance)
+            if (!LogFirstChance)
             {
-                try
-                {
-                    LogE($"First chance: {e.Exception}");
-                }
-                catch (InvalidOperationException) { }
+                return;
             }
+            
+            try
+            {
+                if (!HasFileBeenCreated)
+                {
+                    return;
+                }
+
+                LogE($"First chance: {e.Exception}");
+            }
+            catch (InvalidOperationException) { }
         };
 
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
             try
             {
+                if (!HasFileBeenCreated)
+                {
+                    return;
+                }
+
                 LogE($"Unobserved task exception: {e.Exception}");
             }
             catch (InvalidOperationException) { }
@@ -82,7 +122,12 @@ public static class Logger
         };
     }
 
-    public static async Task CreateFile()
+    public static void CreateFile()
+    {
+        CreateFileAsync().GetAwaiter().GetResult();
+    }
+    
+    public static async Task CreateFileAsync()
     {
         if (!ShouldLog)
         {
@@ -102,7 +147,7 @@ public static class Logger
             _stream = null;
         }
 
-        await _semaphore.WaitAsync();
+        await Semaphore.WaitAsync();
         try
         {
             Directory.CreateDirectory(LogDir);
@@ -112,14 +157,12 @@ public static class Logger
 
             List<string> filePaths = Directory.GetFiles(LogDir).ToList();
             filePaths.Sort((a, b) => File.GetCreationTime(a).CompareTo(File.GetCreationTime(b)));
-            
-            if (filePaths.Any(path => Path.GetFileName(path).StartsWith(date)))
-            {
-                string[] parts = filePaths.Select(Path.GetFileName)
-                                          .Last(path => path.StartsWith(date))
-                                          .TrimEnd(".log".ToCharArray())
-                                          .Split('-');
 
+            string? path = filePaths.Select(Path.GetFileNameWithoutExtension)
+                                    .LastOrDefault(path => path.StartsWith(date));
+            if (path != null)
+            {
+                string[] parts = path.Split('-');
                 if (parts.Length > 3 && int.TryParse(parts[parts.Length - 1], out int index))
                 {
                     filePath = Path.Combine(LogDir, $"{date}-{index + 1}.log");
@@ -140,13 +183,21 @@ public static class Logger
                  Process Architecture: {RuntimeInformation.ProcessArchitecture}
                  Runtime: {RuntimeInformation.FrameworkDescription}
                  CPU Cores: {Environment.ProcessorCount}
+                 
+                 Creation Time: {DateTime.Now.ToString("HH:mm:ss")}
+                 Log Level: {LogLevel}
 
                  ----------
 
                  
                  """;
-
+            
             File.WriteAllText(filePath, info);
+            
+            if (LogToTerminal)
+            {
+                await Console.Out.WriteAsync(info);
+            }
             
             _stream = new FileStream(
                 filePath,
@@ -155,7 +206,24 @@ public static class Logger
                 FileShare.Read,
                 4096,
                 useAsync: true);
+            
+            HasFileBeenCreated = true;
 
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                chmod(filePath, (uint) (UnixFileModes.UserRW | UnixFileModes.GroupRX | UnixFileModes.OtherRX));
+                
+                string? sudoUidStr = Environment.GetEnvironmentVariable("SUDO_UID");
+                string? sudoGidStr = Environment.GetEnvironmentVariable("SUDO_GID");
+
+                if (sudoUidStr != null && sudoGidStr != null &&
+                    uint.TryParse(sudoUidStr, out uint uid) &&
+                    uint.TryParse(sudoGidStr, out uint gid))
+                {
+                    chown(filePath, uid, gid);
+                }
+            }
+            
             if (KeepLogs == -1)
             {
                 return;
@@ -167,9 +235,10 @@ public static class Logger
                 filePaths.RemoveAt(0);
             }
         }
+        catch { }
         finally
         {
-            _semaphore.Release();
+            Semaphore.Release();
         }
     }
 
@@ -179,10 +248,10 @@ public static class Logger
         {
             return;
         }
-        
-        if (_stream == null)
+
+        if (level != LogLevel.Debug && level < LogLevel)
         {
-            throw new InvalidOperationException("File has not been created");
+            return;
         }
         
         if (level == LogLevel.Debug && !LogDebug)
@@ -190,16 +259,28 @@ public static class Logger
             return;
         }
         
-        await _semaphore.WaitAsync();
+        if (_stream == null)
+        {
+            throw new InvalidOperationException("File has not been created");
+        }
+        
+        await Semaphore.WaitAsync();
+        
         try
         {
             byte[] buffer = BuildOutput(level, text);
             await _stream.WriteAsync(buffer, 0, buffer.Length);
             await _stream.FlushAsync();
+            
+            if (LogToTerminal)
+            {
+                await Console.Out.WriteLineAsync(BuildTerminalOutput(level, text));
+            }
         }
+        catch { }
         finally
         {
-            _semaphore.Release();
+            Semaphore.Release();
         }
     }
     
@@ -209,24 +290,44 @@ public static class Logger
     public static Task LogI(string text)
         => Log(LogLevel.Info, text);
 
-    public static Task LogM(string text)
-        => Log(LogLevel.Message, text);
-
     public static Task LogW(string text)
         => Log(LogLevel.Warning, text);
 
     public static Task LogE(string text)
         => Log(LogLevel.Error, text);
+    
+    public static Task LogS(string text)
+        => Log(LogLevel.System, text);
 
-    private static byte[] BuildOutput(LogLevel type, string text)
+    private static byte[] BuildOutput(LogLevel level, string text)
     {
-        return Encoding.UTF8.GetBytes($"[{DateTime.Now.ToString("HH:mm:ss")}] [{type}] --- {text}\n");
+        return Encoding.UTF8.GetBytes($"[{DateTime.Now.ToString("HH:mm:ss")}] [{level}] --- {text}\n");
+    }
+
+    private static string BuildTerminalOutput(LogLevel level, string text)
+    {
+        string colorAnsi = level switch
+        {
+            LogLevel.Debug => LogColor.DebugAnsi,
+            LogLevel.Info => LogColor.InfoAnsi,
+            LogLevel.Warning => LogColor.WarningAnsi,
+            LogLevel.Error => LogColor.ErrorAnsi,
+            LogLevel.System => LogColor.SystemAnsi,
+            _ => LogColor.ResetAnsi,
+        };
+        
+        return $"[{DateTime.Now.ToString("HH:mm:ss")}] [{colorAnsi}{level}{LogColor.ResetAnsi}] --- {text}";
     }
 
     private static void OnExit(object? sender, EventArgs e)
     {
         try
         {
+            if (!HasFileBeenCreated)
+            {
+                return;
+            }
+
             LogI("Process exiting...").GetAwaiter().GetResult();
         }
         catch (InvalidOperationException) { }
